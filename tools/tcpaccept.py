@@ -29,6 +29,7 @@ examples = """examples:
     ./tcpaccept -t        # include timestamps
     ./tcpaccept -P 80,81  # only trace port 80 and 81
     ./tcpaccept -p 181    # only trace PID 181
+    ./tcpaccept -N 4026531992 #trace PIDs in the defined namespace
     ./tcpaccept --cgroupmap ./mappath  # only trace cgroups in this BPF map
 """
 parser = argparse.ArgumentParser(
@@ -43,6 +44,8 @@ parser.add_argument("-p", "--pid",
     help="trace this PID only")
 parser.add_argument("-P", "--port",
     help="comma-separated list of local ports to trace")
+parser.add_argument("-N", "--netns", default=0, type=int,
+                    help="trace this Network Namespace only")
 parser.add_argument("--cgroupmap",
     help="trace cgroups in this BPF map only")
 parser.add_argument("--ebpf", action="store_true",
@@ -65,6 +68,7 @@ struct ipv4_data_t {
     u64 ip;
     u16 lport;
     u16 dport;
+    u32 netns;
     char task[TASK_COMM_LEN];
 };
 BPF_PERF_OUTPUT(ipv4_events);
@@ -77,6 +81,7 @@ struct ipv6_data_t {
     u64 ip;
     u16 lport;
     u16 dport;
+    u32 netns;
     char task[TASK_COMM_LEN];
 };
 BPF_PERF_OUTPUT(ipv6_events);
@@ -150,13 +155,22 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
         return 0;
 
     // pull in details
+    u32 net_ns_inum = 0;
     u16 family = 0, lport = 0, dport;
     family = newsk->__sk_common.skc_family;
     lport = newsk->__sk_common.skc_num;
     dport = newsk->__sk_common.skc_dport;
     dport = ntohs(dport);
+    data4.netns = net_ns_inum;
 
     ##FILTER_PORT##
+    
+#ifdef CONFIG_NET_NS
+    net_ns_inum = newsk->__sk_common.skc_net.net->ns.inum;
+#endif 
+
+    ##FILTER_NETNS##
+
 
     if (family == AF_INET) {
         struct ipv4_data_t data4 = {.pid = pid, .ip = 4};
@@ -165,6 +179,7 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
         data4.daddr = newsk->__sk_common.skc_daddr;
         data4.lport = lport;
         data4.dport = dport;
+        data6.netns = net_ns_inum;
         bpf_get_current_comm(&data4.task, sizeof(data4.task));
         ipv4_events.perf_submit(ctx, &data4, sizeof(data4));
 
@@ -187,13 +202,16 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
 """
 
 bpf_text += bpf_text_kprobe
-
+netns_filter = ""
 # code substitutions
 if args.pid:
     bpf_text = bpf_text.replace('##FILTER_PID##',
         'if (pid != %s) { return 0; }' % args.pid)
 else:
     bpf_text = bpf_text.replace('##FILTER_PID##', '')
+if args.netns:
+    netns_filter = 'if (net_ns_inum != %d) { return 0; }' % args.netns
+bpf_text = bpf_text.replace('##FILTER_NETNS##', netns_filter)
 if args.port:
     lports = [int(lport) for lport in args.port.split(',')]
     lports_if = ' && '.join(['lport != %d' % lport for lport in lports])
@@ -221,6 +239,8 @@ def print_ipv4_event(cpu, data, size):
         if start_ts == 0:
             start_ts = event.ts_us
         printb(b"%-9.3f" % ((float(event.ts_us) - start_ts) / 1000000), nl="")
+    if args.netns:
+        print("%-16d" % event.netns, end="")
     printb(b"%-7d %-12.12s %-2d %-16s %-5d %-16s %-5d" % (event.pid,
         event.task, event.ip,
         inet_ntop(AF_INET, pack("I", event.daddr)).encode(),
@@ -237,6 +257,8 @@ def print_ipv6_event(cpu, data, size):
         if start_ts == 0:
             start_ts = event.ts_us
         printb(b"%-9.3f" % ((float(event.ts_us) - start_ts) / 1000000), nl="")
+    if args.netns:
+        print("%-16d" % event.netns, end="")
     printb(b"%-7d %-12.12s %-2d %-16s %-5d %-16s %-5d" % (event.pid,
         event.task, event.ip,
         inet_ntop(AF_INET6, event.daddr).encode(),
@@ -252,6 +274,8 @@ if args.time:
     print("%-9s" % ("TIME"), end="")
 if args.timestamp:
     print("%-9s" % ("TIME(s)"), end="")
+if args.netns:
+    print("%-16s" % ("NETNS"), end="")
 print("%-7s %-12s %-2s %-16s %-5s %-16s %-5s" % ("PID", "COMM", "IP", "RADDR",
     "RPORT", "LADDR", "LPORT"))
 
